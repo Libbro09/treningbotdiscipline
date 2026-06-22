@@ -127,8 +127,11 @@ def init_db():
                 name         TEXT,
                 wake_time    TEXT DEFAULT '07:00',
                 report_time  TEXT DEFAULT '00:00',
+                check_time   TEXT DEFAULT '14:00',
+                goals        TEXT,
                 last_morning TEXT,
                 last_report  TEXT,
+                last_check   TEXT,
                 created_at   TEXT
             );
             CREATE TABLE IF NOT EXISTS habits (
@@ -146,7 +149,23 @@ def init_db():
             );
             """
         )
+    migrate_db()
     log.info("БД готова: %s", DB_PATH)
+
+
+def migrate_db():
+    """Добавляет новые колонки в уже существующие БД (без потери данных)."""
+    new_cols = {
+        "check_time": "TEXT DEFAULT '14:00'",
+        "goals": "TEXT",
+        "last_check": "TEXT",
+    }
+    with db() as conn:
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        for col, decl in new_cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+                log.info("Миграция: добавлена колонка users.%s", col)
 
 
 def register_user(user_id: int, name: str):
@@ -166,9 +185,14 @@ def get_user(user_id: int):
 
 
 def set_user_time(user_id: int, field: str, value: str):
-    assert field in ("wake_time", "report_time")
+    assert field in ("wake_time", "report_time", "check_time")
     with db() as conn:
         conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+
+
+def set_user_goals(user_id: int, goals: str):
+    with db() as conn:
+        conn.execute("UPDATE users SET goals = ? WHERE user_id = ?", (goals, user_id))
 
 
 def mark_habit(user_id: int, habit: str, day: str = None) -> int:
@@ -260,8 +284,11 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
+            InlineKeyboardButton(text="🗓 Мой график", callback_data="schedule"),
         ]
+    )
+    rows.append(
+        [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -270,7 +297,9 @@ def settings_kb(user) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"⏰ Подъём: {user['wake_time']}", callback_data="set_wake")],
+            [InlineKeyboardButton(text=f"☀️ Чек-ин днём: {user['check_time']}", callback_data="set_check")],
             [InlineKeyboardButton(text=f"🌙 Отчёт: {user['report_time']}", callback_data="set_report")],
+            [InlineKeyboardButton(text="🎯 Мои цели", callback_data="set_goals")],
             [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
         ]
     )
@@ -289,16 +318,31 @@ def plan_text(name: str = None) -> str:
 
 
 # --------------------------------------------------------------------------- #
-#                            УМНЫЙ ТРЕНЕР (DeepSeek)                           #
+#                            УМНЫЙ ТРЕНЕР (Gemini)                             #
 # --------------------------------------------------------------------------- #
 COACH_SYSTEM = (
-    "Ты — личный тренер по дисциплине и привычкам. Общаешься как живой человек, "
-    "а не как робот: коротко, по-человечески, с эмоциями, на «ты». "
-    "Если человек молодец — искренне хвали и подбадривай. Если ленится и пропускает "
-    "привычки — по-доброму, но честно встряхни и покритикуй, без оскорблений. "
-    "Давай конкретные практичные советы по дисциплине, мотивации, режиму сна, воде, "
-    "зарядке и холодному душу. Отвечай на русском, 2–5 предложений, живым языком, "
-    "без списков и без markdown."
+    "Ты — личный тренер по дисциплине, привычкам и здоровому образу жизни. "
+    "Общаешься как живой человек, а не робот: тепло, по-человечески, с эмоциями, на «ты». "
+    "Ты искренне интересуешься, как у человека дела и как проходит день. "
+    "Если человек молодец — искренне хвали. Если ленится — по-доброму, но честно встряхни, "
+    "без оскорблений и без давления. "
+    "Очень важно: ты заботишься о здоровье человека и НЕ предлагаешь ничего экстремального "
+    "или вредного. Высыпаться (7–8 часов), пить воду, разумные нагрузки, отдых и баланс — "
+    "это всегда приоритет. Никакого фанатизма и выгорания. "
+    "Давай конкретные, выполнимые советы. Иногда задавай человеку короткий встречный вопрос про его день, "
+    "самочувствие или настроение, чтобы поддержать диалог. "
+    "Отвечай на русском, 2–5 предложений, живым языком, без markdown и без звёздочек."
+)
+
+# Для построения распорядка дня — здесь списки и структура УМЕСТНЫ.
+SCHEDULE_SYSTEM = (
+    "Ты — опытный тренер по дисциплине и режиму дня, который заботится о здоровье человека. "
+    "Составь реалистичный, выполнимый и здоровый распорядок дня по часам. "
+    "Обязательно учти: полноценный сон 7–8 часов, питьё воды в течение дня, зарядка 10–15 минут, "
+    "холодный душ, приёмы пищи, перерывы и отдых. Режим НЕ должен быть изматывающим — без фанатизма, "
+    "с запасом на отдых и восстановление, чтобы человек не выгорел. "
+    "Пиши на русском, по времени (например '07:00 — подъём, стакан воды'), коротко и понятно. "
+    "В конце добавь 2–3 тёплых совета, как держаться режима и не сорваться. Без markdown и без звёздочек."
 )
 
 
@@ -306,41 +350,65 @@ def user_context(user_id: int) -> str:
     done = get_done_habits(user_id)
     streak = get_streak(user_id)
     _, _, percent = get_week_stats(user_id)
+    u = get_user(user_id)
     done_l = [HABITS[k][0] for k in HABITS if k in done]
     miss_l = [HABITS[k][0] for k in HABITS if k not in done]
-    return (
+    ctx = (
+        f"Имя: {u['name'] if u else 'друг'}. "
         f"Сегодня выполнено: {', '.join(done_l) or 'ничего'}. "
         f"Пропущено сегодня: {', '.join(miss_l) or 'ничего'}. "
         f"Серия: {streak} дней подряд. Выполнение за неделю: {percent}%."
     )
+    if u and u["goals"]:
+        ctx += f" Цели человека: {u['goals']}."
+    return ctx
 
 
-def ask_coach(user_text: str, context_info: str = "") -> str:
-    """Запрос к Google Gemini. Возвращает текст ответа либо None при ошибке."""
+async def gemini_generate(prompt: str, max_tokens: int = 400) -> str:
+    """Низкоуровневый вызов Gemini в отдельном потоке (не блокирует бота)."""
     if not GOOGLE_API_KEY:
         log.warning("Google API ключ не задан")
         return None
-
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
         model = genai.GenerativeModel("gemini-2.5-flash")
-
-        prompt = COACH_SYSTEM + "\n\n"
-        if context_info:
-            prompt += "Данные пользователя: " + context_info + "\n\n"
-        prompt += "Ответь кратко (2–5 предложений), живо, как настоящий тренер:\n\n" + user_text
-
-        log.info("→ Запрос к Gemini: %s", user_text[:50])
-        response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(
-            temperature=0.9,
-            max_output_tokens=400,
-        ))
+        log.info("→ Запрос к Gemini (%s токенов): %s", max_tokens, prompt[-60:])
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.9,
+                max_output_tokens=max_tokens,
+            ),
+        )
         result = response.text.strip()
         log.info("← Gemini OK: %s", result[:50])
         return result
     except Exception as e:
         log.error("Ошибка Gemini: %s", e)
         return None
+
+
+async def ask_coach(user_text: str, context_info: str = "") -> str:
+    """Ответ тренера на сообщение пользователя."""
+    prompt = COACH_SYSTEM + "\n\n"
+    if context_info:
+        prompt += "Данные пользователя: " + context_info + "\n\n"
+    prompt += "Ответь живо, как настоящий тренер:\n\n" + user_text
+    return await gemini_generate(prompt, 400)
+
+
+async def build_schedule(user) -> str:
+    """Строит персональный распорядок дня под цели человека."""
+    goals = (user["goals"] or "").strip() or "выработать дисциплину, лучше высыпаться и быть в форме"
+    prompt = (
+        SCHEDULE_SYSTEM
+        + f"\n\nПодъём человека: {user['wake_time']}. "
+        + f"Вечерний отбой ориентируй так, чтобы было 7–8 часов сна. "
+        + f"Цели человека: {goals}. "
+        + "Составь распорядок на день."
+    )
+    return await gemini_generate(prompt, 1100)
 
 
 # --------------------------------------------------------------------------- #
@@ -358,6 +426,11 @@ async def send_stats(user_id: int):
         f"<pre>{graph}</pre>"
     )
     await bot.send_message(user_id, text)
+
+
+async def send_ai(uid: int, text: str, **kwargs):
+    """Отправка текста от ИИ без HTML-разметки (чтобы спецсимволы не ломали отправку)."""
+    await bot.send_message(uid, text, parse_mode=None, **kwargs)
 
 
 async def send_morning(user):
@@ -380,10 +453,32 @@ async def send_report(user):
         fallback = "Сегодня не получилось, но это не конец. Завтра у нас новый шанс 💪 Не сдавайся!"
     else:
         prompt = "Подведи итог моего дня по привычкам, отметь что я пропустил и дай совет на завтра."
-        fallback = f"Хороший прогресс! Завтра доделаем оставшиеся привычки. Спокойной ночи 🌙"
+        fallback = "Хороший прогресс! Завтра доделаем оставшиеся привычки. Спокойной ночи 🌙"
 
     analysis = await ask_coach(prompt, ctx)
-    await bot.send_message(uid, analysis or fallback)
+    await send_ai(uid, analysis or fallback)
+
+
+async def send_checkin(user):
+    """Дневной чек-ин: бот по-дружески интересуется, как проходит день."""
+    uid = user["user_id"]
+    ctx = user_context(uid)
+    done = get_done_habits(uid)
+    if len(done) == TOTAL_HABITS:
+        prompt = (
+            "Сейчас середина дня. Я уже выполнил все привычки. По-дружески поинтересуйся, "
+            "как проходит мой день и как самочувствие, и похвали. Задай короткий вопрос."
+        )
+        fallback = "Как проходит день? 🙂 Вижу, привычки уже закрыл — красавчик! Как настроение?"
+    else:
+        miss = [HABITS[k][0] for k in HABITS if k not in done]
+        prompt = (
+            "Сейчас середина дня. Поинтересуйся по-дружески, как проходит мой день и как я себя чувствую. "
+            f"Мягко напомни, что ещё осталось сделать: {', '.join(miss)}. Задай короткий вопрос про день."
+        )
+        fallback = f"Привет! Как проходит день? 🙂 Не забудь сегодня: {', '.join(miss)}. Расскажи, как ты?"
+    text = await ask_coach(prompt, ctx)
+    await send_ai(uid, text or fallback, reply_markup=main_menu_kb(uid))
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +497,9 @@ async def minute_tick():
             if u["wake_time"] == hhmm and u["last_morning"] != today:
                 await send_morning(u)
                 set_user_last(uid, "last_morning", today)
+            if u["check_time"] == hhmm and u["last_check"] != today:
+                await send_checkin(u)
+                set_user_last(uid, "last_check", today)
             if u["report_time"] == hhmm and u["last_report"] != today:
                 await send_report(u)
                 set_user_last(uid, "last_report", today)
@@ -410,7 +508,7 @@ async def minute_tick():
 
 
 def set_user_last(user_id: int, field: str, value: str):
-    assert field in ("last_morning", "last_report")
+    assert field in ("last_morning", "last_report", "last_check")
     with db() as conn:
         conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
 
@@ -421,6 +519,8 @@ def set_user_last(user_id: int, field: str, value: str):
 class SettingsForm(StatesGroup):
     wake = State()
     report = State()
+    check = State()
+    goals = State()
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +558,50 @@ async def cmd_stats(message: Message):
     await send_stats(message.from_user.id)
 
 
+async def send_schedule(uid: int, chat_message: Message):
+    u = get_user(uid)
+    if not u:
+        register_user(uid, "друг")
+        u = get_user(uid)
+    if not u["goals"]:
+        await chat_message.answer(
+            "Чтобы построить график именно под тебя, расскажи о своих целях 🎯\n"
+            "Например: «хочу высыпаться, привести себя в форму и меньше прокрастинировать».\n\n"
+            "Напиши их командой /goals — и я составлю распорядок дня."
+        )
+        return
+    await chat_message.answer("🗓 Строю твой персональный график дня... секунду")
+    try:
+        await bot.send_chat_action(uid, "typing")
+    except Exception:
+        pass
+    schedule = await build_schedule(u)
+    if schedule:
+        await send_ai(uid, "🗓 Твой персональный график дня:\n\n" + schedule, reply_markup=main_menu_kb(uid))
+    else:
+        await chat_message.answer(
+            "Не получилось построить график (ИИ не ответил). Проверь /test_api и попробуй ещё раз."
+        )
+
+
+@router.message(Command("plan"))
+async def cmd_plan(message: Message):
+    await send_schedule(message.from_user.id, message)
+
+
+@router.message(Command("goals"))
+async def cmd_goals(message: Message, state: FSMContext):
+    register_user(message.from_user.id, message.from_user.first_name or "друг")
+    await state.set_state(SettingsForm.goals)
+    u = get_user(message.from_user.id)
+    cur = f"\n\nСейчас твои цели: {u['goals']}" if u and u["goals"] else ""
+    await message.answer(
+        "Расскажи, чего ты хочешь добиться 🎯\n"
+        "Например: «высыпаться, набрать форму, перестать прокрастинировать, меньше стресса».\n"
+        "Напиши одним сообщением — и я учту это в графике и советах." + cur
+    )
+
+
 @router.message(Command("settings"))
 async def cmd_settings(message: Message):
     u = get_user(message.from_user.id)
@@ -470,12 +614,15 @@ async def cmd_settings(message: Message):
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "Я — твой тренер по дисциплине.\n\n"
+        "Я — твой тренер по дисциплине 💪\n\n"
         "/menu — план дня и кнопки\n"
         "/stats — статистика\n"
-        "/settings — время подъёма и отчёта\n"
-        "/test_api — проверить DeepSeek\n\n"
-        "А ещё можешь просто написать мне сообщение — отвечу как тренер 💬"
+        "/plan — построить персональный график дня\n"
+        "/goals — задать свои цели\n"
+        "/settings — время подъёма, чек-ина и отчёта\n"
+        "/test_api — проверить ИИ\n\n"
+        "Я буду будить утром, интересоваться днём в обед и подводить итоги вечером. "
+        "А ещё можешь просто написать мне — отвечу как живой тренер 💬"
     )
 
 
@@ -486,7 +633,7 @@ async def cmd_test_api(message: Message):
         return
 
     await message.answer("🔍 Тестирую Google Gemini...")
-    reply = ask_coach("Скажи очень коротко (одно слово): привет!", "")
+    reply = await ask_coach("Скажи очень коротко (одно слово): привет!", "")
 
     if reply:
         await message.answer(f"✅ Gemini работает!\n\n{reply}")
@@ -530,13 +677,37 @@ async def cb_done(call: CallbackQuery):
         if not msg:
             streak = get_streak(call.from_user.id)
             msg = f"🔥 Все привычки выполнены! Серия: {streak} дней подряд. Ты молодец, так держать!"
-        await call.message.answer(msg)
+        await call.message.answer(msg, parse_mode=None)
 
 
 @router.callback_query(F.data == "stats")
 async def cb_stats(call: CallbackQuery):
     await call.answer()
     await send_stats(call.from_user.id)
+
+
+@router.callback_query(F.data == "schedule")
+async def cb_schedule(call: CallbackQuery):
+    await call.answer()
+    await send_schedule(call.from_user.id, call.message)
+
+
+@router.callback_query(F.data == "set_goals")
+async def cb_set_goals(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(SettingsForm.goals)
+    await call.message.answer(
+        "Расскажи о своих целях 🎯\n"
+        "Например: «высыпаться, набрать форму, меньше прокрастинировать».\n"
+        "Напиши одним сообщением."
+    )
+
+
+@router.callback_query(F.data == "set_check")
+async def cb_set_check(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(SettingsForm.check)
+    await call.message.answer("Во сколько мне интересоваться, как проходит день? Формат ЧЧ:ММ, например <b>14:00</b>")
 
 
 @router.callback_query(F.data == "settings")
@@ -587,6 +758,31 @@ async def set_report_value(message: Message, state: FSMContext):
     await message.answer(f"Готово! Вечерний отчёт в {t} 🌙")
 
 
+@router.message(SettingsForm.check)
+async def set_check_value(message: Message, state: FSMContext):
+    t = parse_time(message.text)
+    if not t:
+        await message.answer("Не понял время. Напиши в формате ЧЧ:ММ, например 14:00")
+        return
+    set_user_time(message.from_user.id, "check_time", t)
+    await state.clear()
+    await message.answer(f"Готово! Буду интересоваться твоим днём в {t} ☀️")
+
+
+@router.message(SettingsForm.goals)
+async def set_goals_value(message: Message, state: FSMContext):
+    goals = (message.text or "").strip()
+    if len(goals) < 3:
+        await message.answer("Опиши цели чуть подробнее одним сообщением 🙂")
+        return
+    set_user_goals(message.from_user.id, goals)
+    await state.clear()
+    await message.answer(
+        "Запомнил твои цели 🎯 Теперь учту их в советах и графике.\n"
+        "Хочешь — построю распорядок дня прямо сейчас: /plan"
+    )
+
+
 # Любой свободный текст (вне команд и вне FSM) — общение с тренером.
 @router.message(F.text & ~F.text.startswith("/"), StateFilter(None))
 async def chat_with_coach(message: Message):
@@ -598,7 +794,7 @@ async def chat_with_coach(message: Message):
     ctx = user_context(message.from_user.id)
     reply = await ask_coach(message.text, ctx)
 
-    # Fallback ответы, если DeepSeek не работает
+    # Fallback ответы, если ИИ не работает
     if not reply:
         text_lower = message.text.lower()
         if any(w in text_lower for w in ["помощь", "помоги", "как", "что"]):
@@ -611,7 +807,7 @@ async def chat_with_coach(message: Message):
         else:
             reply = "Я рядом 💪 Отмечай привычки кнопками — вместе справимся!"
 
-    await message.answer(reply, reply_markup=main_menu_kb(message.from_user.id))
+    await message.answer(reply, parse_mode=None, reply_markup=main_menu_kb(message.from_user.id))
 
 
 # --------------------------------------------------------------------------- #
@@ -648,6 +844,8 @@ async def main():
             BotCommand(command="start", description="Запуск / перезапуск"),
             BotCommand(command="menu", description="План дня и кнопки"),
             BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="plan", description="Персональный график дня"),
+            BotCommand(command="goals", description="Задать свои цели"),
             BotCommand(command="settings", description="Настройки времени"),
             BotCommand(command="help", description="Помощь"),
         ]
