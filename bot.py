@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
@@ -50,6 +51,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+# gemini-2.5-flash доступен на бесплатном тарифе этого ключа. Лимит токенов берём
+# с запасом: 2.5 часть бюджета тратит на «размышления», поэтому даём много, чтобы
+# сам ответ не обрезался. Модель можно переопределить через .env.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 TZ_NAME = os.getenv("TZ", "Europe/Moscow")
 DB_PATH = os.getenv("DB_PATH", "habits.db")
 PORT = int(os.getenv("PORT", "8080"))
@@ -322,16 +327,19 @@ def plan_text(name: str = None) -> str:
 # --------------------------------------------------------------------------- #
 COACH_SYSTEM = (
     "Ты — личный тренер по дисциплине, привычкам и здоровому образу жизни. "
-    "Общаешься как живой человек, а не робот: тепло, по-человечески, с эмоциями, на «ты». "
-    "Ты искренне интересуешься, как у человека дела и как проходит день. "
-    "Если человек молодец — искренне хвали. Если ленится — по-доброму, но честно встряхни, "
-    "без оскорблений и без давления. "
-    "Очень важно: ты заботишься о здоровье человека и НЕ предлагаешь ничего экстремального "
-    "или вредного. Высыпаться (7–8 часов), пить воду, разумные нагрузки, отдых и баланс — "
-    "это всегда приоритет. Никакого фанатизма и выгорания. "
-    "Давай конкретные, выполнимые советы. Иногда задавай человеку короткий встречный вопрос про его день, "
-    "самочувствие или настроение, чтобы поддержать диалог. "
-    "Отвечай на русском, 2–5 предложений, живым языком, без markdown и без звёздочек."
+    "Общаешься как живой, тёплый человек на «ты», с эмоциями, искренне интересуешься, "
+    "как дела и как проходит день. "
+    "ГЛАВНОЕ: давай КОНКРЕТНЫЕ, практичные советы — что именно делать и как, по шагам. "
+    "Не отделывайся общими фразами вроде «просто старайся». Если человек просит совет или "
+    "делится проблемой — дай понятный план действий простыми словами: 2–4 конкретных шага, "
+    "что сделать прямо сегодня и как закрепить. Объясняй коротко, почему это работает. "
+    "Хвали за успехи, по-доброму встряхивай за лень — без давления и оскорблений. "
+    "Здоровье в приоритете: высыпаться 7–8 часов, пить воду, разумные нагрузки, отдых, баланс. "
+    "Никакого фанатизма и выгорания. Если человек болеет или плохо себя чувствует "
+    "(температура, боль, сильная усталость) — посоветуй отдохнуть и восстановиться, не нагружать "
+    "себя, при необходимости обратиться к врачу; НЕ заставляй выполнять привычки через силу. "
+    "Иногда задавай короткий встречный вопрос про самочувствие или настроение. "
+    "Отвечай на русском, живым языком, по делу, без markdown и без звёздочек."
 )
 
 # Для построения распорядка дня — здесь списки и структура УМЕСТНЫ.
@@ -364,6 +372,17 @@ def user_context(user_id: int) -> str:
     return ctx
 
 
+def clean_md(text: str) -> str:
+    """Убирает markdown-разметку из ответа ИИ (мы отправляем как обычный текст)."""
+    if not text:
+        return text
+    text = text.replace("**", "").replace("`", "")
+    text = re.sub(r"(?m)^\s*[\*\-]\s+", "• ", text)   # списки → буллеты
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)       # заголовки
+    text = text.replace("*", "")                         # одиночные звёздочки
+    return text.strip()
+
+
 async def gemini_generate(prompt: str, max_tokens: int = 400) -> str:
     """Низкоуровневый вызов Gemini в отдельном потоке (не блокирует бота)."""
     if not GOOGLE_API_KEY:
@@ -371,7 +390,7 @@ async def gemini_generate(prompt: str, max_tokens: int = 400) -> str:
         return None
     try:
         genai.configure(api_key=GOOGLE_API_KEY)
-        model = genai.GenerativeModel("gemini-2.5-flash")
+        model = genai.GenerativeModel(GEMINI_MODEL)
         log.info("→ Запрос к Gemini (%s токенов): %s", max_tokens, prompt[-60:])
         response = await asyncio.to_thread(
             model.generate_content,
@@ -381,7 +400,7 @@ async def gemini_generate(prompt: str, max_tokens: int = 400) -> str:
                 max_output_tokens=max_tokens,
             ),
         )
-        result = response.text.strip()
+        result = clean_md(response.text)
         log.info("← Gemini OK: %s", result[:50])
         return result
     except Exception as e:
@@ -394,8 +413,8 @@ async def ask_coach(user_text: str, context_info: str = "") -> str:
     prompt = COACH_SYSTEM + "\n\n"
     if context_info:
         prompt += "Данные пользователя: " + context_info + "\n\n"
-    prompt += "Ответь живо, как настоящий тренер:\n\n" + user_text
-    return await gemini_generate(prompt, 400)
+    prompt += "Ответь живо и по делу, как настоящий тренер, с конкретными шагами:\n\n" + user_text
+    return await gemini_generate(prompt, 2000)
 
 
 async def build_schedule(user) -> str:
@@ -408,7 +427,7 @@ async def build_schedule(user) -> str:
         + f"Цели человека: {goals}. "
         + "Составь распорядок на день."
     )
-    return await gemini_generate(prompt, 1100)
+    return await gemini_generate(prompt, 3000)
 
 
 # --------------------------------------------------------------------------- #
