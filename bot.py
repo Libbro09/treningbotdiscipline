@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -152,6 +153,21 @@ def init_db():
                 done_count INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, date)
             );
+            CREATE TABLE IF NOT EXISTS plan_items (
+                user_id INTEGER,
+                idx     INTEGER,
+                time    TEXT,
+                title   TEXT,
+                PRIMARY KEY (user_id, idx)
+            );
+            CREATE TABLE IF NOT EXISTS plan_status (
+                user_id  INTEGER,
+                date     TEXT,
+                idx      INTEGER,
+                notified INTEGER DEFAULT 0,
+                done     INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, date, idx)
+            );
             """
         )
     migrate_db()
@@ -277,6 +293,97 @@ def build_graph(days, done_by_date) -> str:
     return "\n".join(lines)
 
 
+# ----------------------------- ПЕРСОНАЛЬНЫЙ ПЛАН ---------------------------- #
+def save_plan(user_id: int, items: list):
+    """Сохраняет план (список (time, title)), заменяя предыдущий."""
+    with db() as conn:
+        conn.execute("DELETE FROM plan_items WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM plan_status WHERE user_id = ?", (user_id,))
+        for idx, (t, title) in enumerate(items):
+            conn.execute(
+                "INSERT INTO plan_items (user_id, idx, time, title) VALUES (?, ?, ?, ?)",
+                (user_id, idx, t, title),
+            )
+
+
+def get_plan(user_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT idx, time, title FROM plan_items WHERE user_id = ? ORDER BY idx", (user_id,)
+        ).fetchall()
+
+
+def get_plan_done(user_id: int, day: str = None) -> set:
+    day = day or today_str()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT idx FROM plan_status WHERE user_id = ? AND date = ? AND done = 1",
+            (user_id, day),
+        ).fetchall()
+    return {r["idx"] for r in rows}
+
+
+def set_plan_done(user_id: int, idx: int, done: bool, day: str = None):
+    day = day or today_str()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO plan_status (user_id, date, idx, done) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, date, idx) DO UPDATE SET done = excluded.done",
+            (user_id, day, idx, 1 if done else 0),
+        )
+
+
+def is_plan_notified(user_id: int, idx: int, day: str = None) -> bool:
+    day = day or today_str()
+    with db() as conn:
+        r = conn.execute(
+            "SELECT notified FROM plan_status WHERE user_id = ? AND date = ? AND idx = ?",
+            (user_id, day, idx),
+        ).fetchone()
+    return bool(r and r["notified"])
+
+
+def mark_plan_notified(user_id: int, idx: int, day: str = None):
+    day = day or today_str()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO plan_status (user_id, date, idx, notified) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(user_id, date, idx) DO UPDATE SET notified = 1",
+            (user_id, day, idx),
+        )
+
+
+def parse_plan_json(raw: str) -> list:
+    """Парсит JSON-план от ИИ в список (time, title)."""
+    if not raw:
+        return []
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```$", "", raw).strip()
+    m = re.search(r"\[.*\]", raw, re.S)
+    if m:
+        raw = m.group(0)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return []
+    items = []
+    for d in data:
+        if not isinstance(d, dict):
+            continue
+        t = parse_time(str(d.get("time", "")))
+        title = str(d.get("title", "")).strip()
+        if t and title:
+            items.append((t, title[:60]))
+    items.sort(key=lambda x: x[0])
+    return items[:14]
+
+
+def plan_readable(items: list) -> str:
+    lines = [f"{t} — {title}" for (t, title) in items]
+    return "🗓 Твой план на день:\n\n" + "\n".join(lines) + "\n\nБуду напоминать в эти времена ⏰"
+
+
 # --------------------------------------------------------------------------- #
 #                              КЛАВИАТУРЫ / ТЕКСТЫ                             #
 # --------------------------------------------------------------------------- #
@@ -289,12 +396,27 @@ def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     rows.append(
         [
             InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton(text="🗓 Мой график", callback_data="schedule"),
+            InlineKeyboardButton(text="📋 План дня", callback_data="planview"),
         ]
+    )
+    rows.append(
+        [InlineKeyboardButton(text="🗓 Построить график", callback_data="schedule")]
     )
     rows.append(
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def plan_kb(user_id: int) -> InlineKeyboardMarkup:
+    items = get_plan(user_id)
+    done = get_plan_done(user_id)
+    rows = []
+    for it in items:
+        mark = "✅" if it["idx"] in done else "⬜"
+        label = f"{mark} {it['time']} {it['title']}"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"pdone:{it['idx']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -342,15 +464,12 @@ COACH_SYSTEM = (
     "Отвечай на русском, живым языком, по делу, без markdown и без звёздочек."
 )
 
-# Для построения распорядка дня — здесь списки и структура УМЕСТНЫ.
+# Для построения распорядка дня — нужен СТРОГО структурированный JSON.
 SCHEDULE_SYSTEM = (
     "Ты — опытный тренер по дисциплине и режиму дня, который заботится о здоровье человека. "
     "Составь реалистичный, выполнимый и здоровый распорядок дня по часам. "
-    "Обязательно учти: полноценный сон 7–8 часов, питьё воды в течение дня, зарядка 10–15 минут, "
-    "холодный душ, приёмы пищи, перерывы и отдых. Режим НЕ должен быть изматывающим — без фанатизма, "
-    "с запасом на отдых и восстановление, чтобы человек не выгорел. "
-    "Пиши на русском, по времени (например '07:00 — подъём, стакан воды'), коротко и понятно. "
-    "В конце добавь 2–3 тёплых совета, как держаться режима и не сорваться. Без markdown и без звёздочек."
+    "Режим НЕ должен быть изматывающим — полноценный сон 7–8 часов, перерывы, отдых и баланс, "
+    "без фанатизма и выгорания. Заголовки пунктов делай короткими и понятными (до 60 символов)."
 )
 
 
@@ -417,17 +536,21 @@ async def ask_coach(user_text: str, context_info: str = "") -> str:
     return await gemini_generate(prompt, 2000)
 
 
-async def build_schedule(user) -> str:
-    """Строит персональный распорядок дня под цели человека."""
+async def generate_plan_items(user) -> list:
+    """Просит ИИ построить распорядок дня и возвращает список (time, title)."""
     goals = (user["goals"] or "").strip() or "выработать дисциплину, лучше высыпаться и быть в форме"
     prompt = (
         SCHEDULE_SYSTEM
-        + f"\n\nПодъём человека: {user['wake_time']}. "
-        + f"Вечерний отбой ориентируй так, чтобы было 7–8 часов сна. "
+        + f"\n\nПодъём человека: {user['wake_time']}. Сон 7–8 часов, отбой подбери соответственно. "
         + f"Цели человека: {goals}. "
-        + "Составь распорядок на день."
+        + "Обязательно включи пункты: подъём со стаканом воды, зарядка 10–15 минут, холодный душ, "
+        + "приёмы пищи, перерывы/отдых, отбой. "
+        + "Верни ТОЛЬКО JSON-массив из 8–12 объектов вида "
+        + '[{"time":"07:00","title":"Подъём, стакан воды"}], по возрастанию времени, '
+        + "на русском, без какого-либо текста вне JSON и без markdown."
     )
-    return await gemini_generate(prompt, 3000)
+    raw = await gemini_generate(prompt, 2000)
+    return parse_plan_json(raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -522,8 +645,25 @@ async def minute_tick():
             if u["report_time"] == hhmm and u["last_report"] != today:
                 await send_report(u)
                 set_user_last(uid, "last_report", today)
+            await send_plan_reminders(u, hhmm)
         except Exception:
             log.exception("Ошибка рассылки для user_id=%s", uid)
+
+
+async def send_plan_reminders(user, hhmm: str):
+    """Напоминания по персональному плану в назначенное время."""
+    uid = user["user_id"]
+    for it in get_plan(uid):
+        if it["time"] == hhmm and not is_plan_notified(uid, it["idx"]):
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Сделал(а)", callback_data=f"pdone:{it['idx']}")]
+                ]
+            )
+            await bot.send_message(
+                uid, f"⏰ По плану сейчас ({it['time']}):\n{it['title']}", reply_markup=kb
+            )
+            mark_plan_notified(uid, it["idx"])
 
 
 def set_user_last(user_id: int, field: str, value: str):
@@ -594,13 +734,20 @@ async def send_schedule(uid: int, chat_message: Message):
         await bot.send_chat_action(uid, "typing")
     except Exception:
         pass
-    schedule = await build_schedule(u)
-    if schedule:
-        await send_ai(uid, "🗓 Твой персональный график дня:\n\n" + schedule, reply_markup=main_menu_kb(uid))
-    else:
+    items = await generate_plan_items(u)
+    if not items:
         await chat_message.answer(
-            "Не получилось построить график (ИИ не ответил). Проверь /test_api и попробуй ещё раз."
+            "Не получилось построить график (ИИ не ответил или превышен лимит). "
+            "Проверь /test_api и попробуй ещё раз."
         )
+        return
+    save_plan(uid, items)
+    await bot.send_message(uid, plan_readable(items))
+    await bot.send_message(
+        uid,
+        "📋 Отмечай выполнение по плану кнопками — а я буду напоминать в нужное время ⏰",
+        reply_markup=plan_kb(uid),
+    )
 
 
 @router.message(Command("plan"))
@@ -709,6 +856,34 @@ async def cb_stats(call: CallbackQuery):
 async def cb_schedule(call: CallbackQuery):
     await call.answer()
     await send_schedule(call.from_user.id, call.message)
+
+
+@router.callback_query(F.data == "planview")
+async def cb_planview(call: CallbackQuery):
+    await call.answer()
+    items = get_plan(call.from_user.id)
+    if not items:
+        await call.message.answer(
+            "У тебя ещё нет плана на день. Нажми «🗓 Построить график» или команду /plan."
+        )
+        return
+    await call.message.answer("📋 Твой план на сегодня:", reply_markup=plan_kb(call.from_user.id))
+
+
+@router.callback_query(F.data.startswith("pdone:"))
+async def cb_pdone(call: CallbackQuery):
+    try:
+        idx = int(call.data.split(":", 1)[1])
+    except ValueError:
+        await call.answer()
+        return
+    already = idx in get_plan_done(call.from_user.id)
+    set_plan_done(call.from_user.id, idx, not already)
+    await call.answer("Снято" if already else "Отмечено! 💪")
+    try:
+        await call.message.edit_reply_markup(reply_markup=plan_kb(call.from_user.id))
+    except Exception:
+        pass
 
 
 @router.callback_query(F.data == "set_goals")
